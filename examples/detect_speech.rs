@@ -69,8 +69,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let chunk_transitions = vad.process(&full_chunk)?;
         transitions.extend(chunk_transitions);
 
-        let output = vad.forward(full_chunk)?;
-        let prob = output.try_extract_tensor::<f32>()?[[0, 0]];
+        let prob = vad.forward(full_chunk)?;
 
         let start_ms = i * chunk_ms;
         let sample_rate_ms = sample_rate / 1000;

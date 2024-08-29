@@ -1,7 +1,10 @@
 #![doc = include_str!("../README.md")]
-use anyhow::{bail, Context, Result};
-use ndarray::{Array1, Array2, Array3, ArrayBase, Ix1, Ix3, OwnedRepr};
+use anyhow::{anyhow, bail, Context, Result};
+use ndarray::{Array1, Array2, Array3, ArrayBase, ArrayView3, Ix3, OwnedRepr};
 use ort::{GraphOptimizationLevel, Session};
+use rten::Model;
+use rten_tensor::prelude::*;
+use rten_tensor::{NdTensor, NdTensorView};
 use std::ops::Range;
 use std::path::Path;
 use std::time::Duration;
@@ -17,6 +20,9 @@ pub struct VadConfig {
     pub redemption_time: Duration,
     pub sample_rate: usize,
     pub min_speech_time: Duration,
+
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub backend: VadBackend,
 }
 
 /// A VAD session create one of these for each audio stream you want to detect voice activity on
@@ -24,10 +30,10 @@ pub struct VadConfig {
 #[derive(Debug)]
 pub struct VadSession {
     config: VadConfig,
-    model: Session, // TODO: would this be safe to share? does the runtime graph hold any state?
+    model: VadModel,
     h_tensor: ArrayBase<OwnedRepr<f32>, Ix3>,
     c_tensor: ArrayBase<OwnedRepr<f32>, Ix3>,
-    sample_rate_tensor: ArrayBase<OwnedRepr<i64>, Ix1>,
+    sample_rate: usize,
     state: VadState,
     session_audio: Vec<f32>,
     processed_samples: usize,
@@ -45,6 +51,131 @@ enum VadState {
         speech_time: Duration,
     },
     Silence,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum VadBackend {
+    Ort,
+    #[default]
+    RTen,
+}
+
+enum VadModel {
+    Ort(Session),
+    RTen(Model),
+}
+
+impl std::fmt::Debug for VadModel {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            fmt,
+            "{}",
+            match self {
+                VadModel::Ort(_) => "VadModel::Ort",
+                VadModel::RTen(_) => "VadModel::RTen",
+            }
+        )
+    }
+}
+
+impl VadModel {
+    fn run(
+        &self,
+        h_tensor: ArrayView3<f32>,
+        c_tensor: ArrayView3<f32>,
+        sample_rate: usize,
+        input: &[f32],
+    ) -> Result<(Array3<f32>, Array3<f32>, f32)> {
+        match self {
+            VadModel::Ort(session) => {
+                let samples = input.len();
+                let audio_tensor = Array2::from_shape_vec((1, samples), input.to_vec())?;
+                let sample_rate_tensor = Array1::from_vec(vec![sample_rate as i64]);
+                let mut result = session.run(ort::inputs![
+                    audio_tensor.view(),
+                    sample_rate_tensor.view(),
+                    h_tensor,
+                    c_tensor,
+                ]?)?;
+
+                // Update internal state tensors.
+                let h_tensor = result
+                    .get("hn")
+                    .unwrap()
+                    .try_extract_tensor::<f32>()?
+                    .to_owned()
+                    .into_shape((2, 1, 64))
+                    .context("Shape mismatch for h_tensor")?;
+
+                let c_tensor = result
+                    .get("cn")
+                    .unwrap()
+                    .try_extract_tensor::<f32>()?
+                    .to_owned()
+                    .into_shape((2, 1, 64))
+                    .context("Shape mismatch for h_tensor")?;
+
+                let prob = result
+                    .remove("output")
+                    .unwrap()
+                    .try_extract_tensor::<f32>()?
+                    .into_shape((1, 1))?
+                    .first()
+                    .copied()
+                    .ok_or(anyhow!("empty prob output"))?;
+
+                Ok((h_tensor, c_tensor, prob))
+            }
+            #[allow(unreachable_code)]
+            VadModel::RTen(model) => {
+                let input_id = model.node_id("input")?;
+                let h_id = model.node_id("h")?;
+                let c_id = model.node_id("c")?;
+                let sr_id = model.node_id("sr")?;
+                let hn_id = model.node_id("hn")?;
+                let cn_id = model.node_id("cn")?;
+                let prob_id = model.node_id("output")?;
+
+                let input_tensor = NdTensorView::from_data([1, input.len()], input);
+                let h_tensor_rten = h_tensor
+                    .as_slice()
+                    .map(|x| NdTensorView::from_data(h_tensor.dim().into(), x))
+                    .ok_or(anyhow!("h input not contiguous"))?;
+                let c_tensor_rten = c_tensor
+                    .as_slice()
+                    .map(|x| NdTensorView::from_data(c_tensor.dim().into(), x))
+                    .ok_or(anyhow!("c input not contiguous"))?;
+                let sr_tensor_rten = NdTensor::from_scalar(sample_rate as i32);
+
+                let [hn, cn, prob] = model.run_n(
+                    [
+                        (input_id, input_tensor.into()),
+                        (h_id, h_tensor_rten.into()),
+                        (c_id, c_tensor_rten.into()),
+                        (sr_id, sr_tensor_rten.into()),
+                    ]
+                    .into(),
+                    [hn_id, cn_id, prob_id],
+                    None,
+                )?;
+
+                let h_tensor: NdTensor<f32, 3> = hn.try_into()?;
+                let h_tensor = Array3::from_shape_vec(h_tensor.shape(), h_tensor.into_data())?;
+
+                let c_tensor: NdTensor<f32, 3> = cn.try_into()?;
+                let c_tensor = Array3::from_shape_vec(c_tensor.shape(), c_tensor.into_data())?;
+
+                let prob: NdTensor<f32, 2> = prob.try_into()?;
+                let prob = prob
+                    .get([0, 0])
+                    .copied()
+                    .ok_or(anyhow!("empty prob output"))?;
+
+                Ok((h_tensor, c_tensor, prob))
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,20 +205,29 @@ impl VadSession {
         if ![8000_usize, 16000].contains(&config.sample_rate) {
             bail!("Unsupported sample rate, use 8000 or 16000!");
         }
-        let model = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(4)?
-            .commit_from_memory(model_bytes)?;
+
+        let model = match config.backend {
+            VadBackend::Ort => {
+                let session = Session::builder()?
+                    .with_optimization_level(GraphOptimizationLevel::Level3)?
+                    .with_intra_threads(4)?
+                    .commit_from_memory(model_bytes)?;
+                VadModel::Ort(session)
+            }
+            VadBackend::RTen => {
+                let model = Model::load(model_bytes.to_vec())?;
+                VadModel::RTen(model)
+            }
+        };
         let h_tensor = Array3::<f32>::zeros((2, 1, 64));
         let c_tensor = Array3::<f32>::zeros((2, 1, 64));
-        let sample_rate_tensor = Array1::from_vec(vec![config.sample_rate as i64]);
 
         Ok(Self {
             config,
             model,
             h_tensor,
             c_tensor,
-            sample_rate_tensor,
+            sample_rate: config.sample_rate,
             state: VadState::Silence,
             session_audio: vec![],
             processed_samples: 0,
@@ -101,10 +241,21 @@ impl VadSession {
     /// embedded within the library so this will increase binary size by 1.7M.
     #[cfg(feature = "static-model")]
     pub fn new(config: VadConfig) -> Result<Self> {
-        let model_bytes: &[u8] = include_bytes!(concat!(
+        let ort_model_bytes: &[u8] = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/models/silero_vad.onnx"
         ));
+
+        let rten_model_bytes: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/models/silero_vad.rten"
+        ));
+
+        let model_bytes = match config.backend {
+            VadBackend::Ort => ort_model_bytes,
+            VadBackend::RTen => rten_model_bytes,
+        };
+
         Self::new_from_bytes(model_bytes, config)
     }
 
@@ -142,35 +293,18 @@ impl VadSession {
         Ok(transitions)
     }
 
-    pub fn forward(&mut self, input: Vec<f32>) -> Result<ort::Value> {
-        let samples = input.len();
-        let audio_tensor = Array2::from_shape_vec((1, samples), input)?;
-        let mut result = self.model.run(ort::inputs![
-            audio_tensor.view(),
-            self.sample_rate_tensor.view(),
+    pub fn forward(&mut self, input: Vec<f32>) -> Result<f32> {
+        let (h_tensor, c_tensor, prob) = self.model.run(
             self.h_tensor.view(),
-            self.c_tensor.view()
-        ]?)?;
+            self.c_tensor.view(),
+            self.sample_rate,
+            &input,
+        )?;
 
-        // Update internal state tensors.
-        self.h_tensor = result
-            .get("hn")
-            .unwrap()
-            .try_extract_tensor::<f32>()?
-            .to_owned()
-            .into_shape((2, 1, 64))
-            .context("Shape mismatch for h_tensor")?;
+        self.h_tensor = h_tensor;
+        self.c_tensor = c_tensor;
 
-        self.c_tensor = result
-            .get("cn")
-            .unwrap()
-            .try_extract_tensor::<f32>()?
-            .to_owned()
-            .into_shape((2, 1, 64))
-            .context("Shape mismatch for h_tensor")?;
-
-        let prob_tensor = result.remove("output").unwrap();
-        Ok(prob_tensor)
+        Ok(prob)
     }
 
     /// Advance the VAD state machine with an audio frame. Keep between 30-96ms in length.
@@ -182,9 +316,7 @@ impl VadSession {
         let audio_frame = self.session_audio[range].to_vec();
         let samples = audio_frame.len();
 
-        let result = self.forward(audio_frame)?;
-
-        let prob = *result.try_extract_tensor::<f32>().unwrap().first().unwrap();
+        let prob = self.forward(audio_frame)?;
 
         let mut vad_change = None;
 
@@ -336,6 +468,7 @@ impl Default for VadConfig {
             redemption_time: Duration::from_millis(600),
             sample_rate: 16000,
             min_speech_time: Duration::from_millis(90),
+            backend: VadBackend::default(),
         }
     }
 }
@@ -344,13 +477,21 @@ impl Default for VadConfig {
 mod tests {
     use super::*;
 
+    fn model_path(backend: VadBackend) -> &'static str {
+        match backend {
+            VadBackend::Ort => "models/silero_vad.onnx",
+            VadBackend::RTen => "models/silero_vad.rten",
+        }
+    }
+
     /// Basic smoke test that the model loads correctly and we haven't committed rubbish to the
     /// repo.
     #[test]
     fn model_loads() {
-        let _sesion = VadSession::new(VadConfig::default()).unwrap();
-        let _sesion =
-            VadSession::new_from_path("models/silero_vad.onnx", VadConfig::default()).unwrap();
+        let cfg = VadConfig::default();
+        let model_path = model_path(cfg.backend);
+        let _sesion = VadSession::new(cfg).unwrap();
+        let _sesion = VadSession::new_from_path(model_path, VadConfig::default()).unwrap();
     }
 
     /// Too short tensors result in inference errors which we don't want to unnecessarily bubble up
@@ -390,10 +531,11 @@ mod tests {
         VadSession::new(config.clone()).unwrap();
 
         config.sample_rate += 1;
+        let model_path = model_path(config.backend);
         assert!(VadSession::new(config.clone()).is_err());
-        assert!(VadSession::new_from_path("models/silero_vad.onnx", config.clone()).is_err());
+        assert!(VadSession::new_from_path(model_path, config.clone()).is_err());
 
-        let bytes = std::fs::read("models/silero_vad.onnx").unwrap();
+        let bytes = std::fs::read(model_path).unwrap();
         assert!(VadSession::new_from_bytes(&bytes, config).is_err());
     }
 }
